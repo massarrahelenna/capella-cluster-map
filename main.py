@@ -213,9 +213,11 @@ groups.forEach(g => {{
 </body>
 </html>"""
 
-with open('meu_globo_3d.html', 'w', encoding='utf-8') as f:
+output_path = os.path.join('output', 'meu_globo_3d.html')
+os.makedirs('output', exist_ok=True)
+with open(output_path, 'w', encoding='utf-8') as f:
     f.write(html)
 
-import webbrowser, os
-webbrowser.open('file://' + os.path.abspath('meu_globo_3d.html'))
+import webbrowser
+webbrowser.open('file://' + os.path.abspath(output_path))
 print(f"🚀 SUCESSO! Arquivo criado com {total_locais} locais e {total_imagens} imagens.")
