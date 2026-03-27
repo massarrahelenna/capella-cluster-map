@@ -3,13 +3,13 @@ import json
 import boto3
 import requests
 import base64
+import io
 from pathlib import Path
 
 EXCEL_PATH = "resultados_editado.xlsx"
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-MIN_IMAGENS = 1
 MAX_LOCAIS = 9999
 
 CLASSES_POSSIVEIS = [
@@ -26,20 +26,19 @@ CLASSES_POSSIVEIS = [
 
 CAPELLA_S3_BASE = "https://capella-open-data.s3.amazonaws.com/stac/capella-open-data-by-datetime"
 
+AGRUPAMENTO_PRECISAO = 1
+
 def stac_id_para_urls(stac_id: str) -> dict:
     """
-    Monta todas as URLs a partir do stac_id.
-    Exemplo de stac_id:
-      CAPELLA_C13_SP_SLC_HH_20251108032444_20251108032453
-    A data está nos caracteres após o 5º underscore: 20251108 → 2025/11/08
+    Monta URLs a partir do stac_id.
+    Ex: CAPELLA_C13_SP_GEO_HH_20251108032444_20251108032453
     """
     try:
-        # Extrai a data do stac_id (6ª parte após split por '_')
         partes = stac_id.split("_")
-        data_str = partes[5]          # ex: "20251108032444"
-        ano  = data_str[0:4]          # "2025"
-        mes  = data_str[4:6]          # "11"
-        dia  = data_str[6:8]          # "08"
+        data_str = partes[5]
+        ano = data_str[0:4]
+        mes = data_str[4:6]
+        dia = data_str[6:8]
 
         pasta = (
             f"{CAPELLA_S3_BASE}"
@@ -49,52 +48,121 @@ def stac_id_para_urls(stac_id: str) -> dict:
             f"/{stac_id}"
         )
 
+        preview_candidates = [
+            f"{pasta}/{stac_id}_PREVIEW.tif",
+            f"{pasta}/{stac_id}_OVERVIEW.tif",
+            f"{pasta}/preview.tif",
+            f"{pasta}/overview.tif",
+            f"{pasta}/thumbnail.png",   
+        ]
+
+        stac_browser = (
+            "https://radiantearth.github.io/stac-browser/#/external/"
+            f"capella-open-data.s3.amazonaws.com/stac/capella-open-data-by-datetime"
+            f"/capella-open-data-{ano}/capella-open-data-{ano}-{mes}"
+            f"/capella-open-data-{ano}-{mes}-{dia}/{stac_id}/{stac_id}.json"
+        )
+
         return {
-            "thumbnail": f"{pasta}/thumbnail.png",
+            "preview_candidates": preview_candidates,
             "stac_json": f"{pasta}/{stac_id}.json",
-            "stac_browser": (
-                "https://radiantearth.github.io/stac-browser/#/external/"
-                f"capella-open-data.s3.amazonaws.com/stac/capella-open-data-by-datetime"
-                f"/capella-open-data-{ano}/capella-open-data-{ano}-{mes}"
-                f"/capella-open-data-{ano}-{mes}-{dia}/{stac_id}/{stac_id}.json"
-            ),
+            "stac_browser": stac_browser,
         }
     except Exception:
-        return {"thumbnail": None, "stac_json": None, "stac_browser": None}
+        return {"preview_candidates": [], "stac_json": None, "stac_browser": None}
 
+def baixar_preview_base64(stac_id: str) -> tuple[str | None, str | None]:
+    """
+    Tenta baixar o preview do item STAC.
+    Primeiro lê o JSON para pegar o href exato do asset 'preview'.
+    Fallback: tenta URLs candidatas em ordem.
+    Retorna: (base64_bytes, url_usada)
+    """
+    MAX_BYTES = 5 * 1024 * 1024  # 5MB max — evita baixar GeoTIFF completo
+    TIMEOUT_JSON = 5
+    TIMEOUT_IMG = 8
 
-def baixar_thumbnail_base64(url: str) -> str | None:
-    """Baixa a thumbnail e retorna como base64 para enviar ao Claude via Bedrock."""
+    urls_info = stac_id_para_urls(stac_id)
+
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(urls_info["stac_json"], timeout=TIMEOUT_JSON)
         if r.status_code == 200:
-            return base64.b64encode(r.content).decode("utf-8")
+            stac = r.json()
+            assets = stac.get("assets", {})
+            for key, asset in assets.items():
+                roles = asset.get("roles", [])
+                if any(role in roles for role in ["overview", "thumbnail", "visual"]):
+                    href = asset.get("href", "")
+                    # Stream com limite de tamanho
+                    img_r = requests.get(href, timeout=TIMEOUT_IMG, stream=True)
+                    if img_r.status_code == 200:
+                        content = b""
+                        for chunk in img_r.iter_content(chunk_size=65536):
+                            content += chunk
+                            if len(content) > MAX_BYTES:
+                                break
+                        img_r.close()
+                        media_type = asset.get("type", "image/tiff")
+                        data_b64 = _converter_para_png_b64(content, media_type)
+                        if data_b64:
+                            return data_b64, href
     except Exception:
         pass
-    return None
 
+    for url in urls_info.get("preview_candidates", []):
+        try:
+            r = requests.get(url, timeout=TIMEOUT_IMG, stream=True)
+            if r.status_code == 200:
+                content = b""
+                for chunk in r.iter_content(chunk_size=65536):
+                    content += chunk
+                    if len(content) > MAX_BYTES:
+                        break
+                r.close()
+                media_type = "image/tiff" if url.endswith(".tif") else "image/png"
+                data_b64 = _converter_para_png_b64(content, media_type)
+                if data_b64:
+                    return data_b64, url
+        except Exception:
+            continue
 
-def escolher_thumbnail_representativa(grupo: pd.DataFrame) -> tuple[str, str, str]:
-    """
-    Escolhe a melhor thumbnail do grupo para enviar ao Claude:
-    - Prefere GEO (imagem geocodificada, mais legível visualmente)
-    - Entre as GEO, pega a de resolução mais alta
-    Retorna: (stac_id, thumbnail_url, stac_browser_url)
-    """
-    # Preferência: GEO > SLC > outros
+    return None, None
+
+def _converter_para_png_b64(content: bytes, media_type: str) -> str | None:
+    """Converte bytes de imagem (TIF ou PNG) para base64 PNG."""
+    try:
+        from PIL import Image
+        import numpy as np
+
+        img = Image.open(io.BytesIO(content))
+
+        if img.mode not in ("RGB", "RGBA", "L"):
+            arr = np.array(img, dtype=float)
+            p2, p98 = np.percentile(arr[arr > 0], [2, 98]) if arr.max() > 0 else (0, 1)
+            arr = np.clip((arr - p2) / max(p98 - p2, 1e-6) * 255, 0, 255).astype("uint8")
+            img = Image.fromarray(arr, mode="L")
+
+        img.thumbnail((512, 512), Image.LANCZOS)
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        if b"\x89PNG" in content[:8]:
+            return base64.b64encode(content).decode("utf-8")
+        return None
+
+def escolher_thumbnail_representativa(grupo: pd.DataFrame) -> tuple[str, str]:
+    """Escolhe o melhor stac_id do grupo e retorna (stac_id, stac_browser_url)."""
     for tipo in ["GEO", "SLC", "GEC"]:
         sub = grupo[grupo['stac_id'].str.contains(f"_{tipo}_")]
         if not sub.empty:
-            # Pega a de menor resolução_range (= maior resolução espacial)
             melhor = sub.loc[sub['resolution_range'].idxmin()]
             urls = stac_id_para_urls(melhor['stac_id'])
-            return melhor['stac_id'], urls["thumbnail"], urls["stac_browser"]
-
-    # Fallback: qualquer uma
+            return melhor['stac_id'], urls["stac_browser"]
     melhor = grupo.loc[grupo['resolution_range'].idxmin()]
     urls = stac_id_para_urls(melhor['stac_id'])
-    return melhor['stac_id'], urls["thumbnail"], urls["stac_browser"]
-
+    return melhor['stac_id'], urls["stac_browser"]
 
 def buscar_contexto_geo(lat: float, lon: float) -> dict:
     try:
@@ -103,7 +171,6 @@ def buscar_contexto_geo(lat: float, lon: float) -> dict:
         return r.json() if r.status_code == 200 else {}
     except Exception:
         return {}
-
 
 def buscar_wikipedia(lat: float, lon: float, raio_km: int = 100) -> str:
     try:
@@ -134,7 +201,6 @@ def buscar_wikipedia(lat: float, lon: float, raio_km: int = 100) -> str:
     except Exception:
         return ""
 
-
 def analisar_metadados_tecnicos(grupo: pd.DataFrame) -> dict:
     return {
         "total_imagens": len(grupo),
@@ -146,7 +212,6 @@ def analisar_metadados_tecnicos(grupo: pd.DataFrame) -> dict:
         "resolucao_media": round(grupo['resolution_range'].mean(), 3),
         "imagens_por_mes": round(len(grupo) / max((grupo['datetime'].max() - grupo['datetime'].min()).days / 30, 1), 1),
     }
-
 
 def sinais_indiretos(lat: float, lon: float, grupo: pd.DataFrame) -> dict:
     periodo = (grupo['datetime'].max() - grupo['datetime'].min()).days
@@ -170,7 +235,6 @@ def sinais_indiretos(lat: float, lon: float, grupo: pd.DataFrame) -> dict:
         "multiplas_plataformas": len(grupo['platform'].unique()) > 1,
     }
 
-
 def classificar_local(grupo: pd.DataFrame, lat: float, lon: float) -> dict:
     bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
 
@@ -189,14 +253,13 @@ def classificar_local(grupo: pd.DataFrame, lat: float, lon: float) -> dict:
         address.get("country")
     ])) or f"{lat:.2f}, {lon:.2f}"
 
-    # ── Tenta carregar thumbnail ──────────────────
-    stac_repr, thumb_url, stac_browser_url = escolher_thumbnail_representativa(grupo)
-    thumb_b64 = baixar_thumbnail_base64(thumb_url) if thumb_url else None
+    stac_repr, stac_browser_url = escolher_thumbnail_representativa(grupo)
+    thumb_b64, thumb_url_usada = baixar_preview_base64(stac_repr)
     tem_imagem = thumb_b64 is not None
 
     classes_str = "\n".join(f"- {c}" for c in CLASSES_POSSIVEIS)
 
-    texto_contexto = f"""Você é um analista sênior de inteligência geoespacial com expertise em imagens SAR.
+    texto = f"""Você é um analista sênior de inteligência geoespacial com expertise em imagens SAR.
 Classifique este local monitorado pela Capella Space.
 
 ════════════════════════════════════════
@@ -213,7 +276,7 @@ SINAIS INDIRETOS
 Zona climática: {sinais['zona_climatica']} (hemisfério {sinais['hemisferio']})
 Tropical (potencial agrícola): {'SIM' if sinais['proximo_equador'] else 'NÃO'}
 Costa oeste Austrália (Pilbara/mineração): {'SIM' if sinais['costa_oeste_australia'] else 'NÃO'}
-Costa leste Austrália: {'SIM' if sinais['costa_leste_australia'] else 'NÃO'}
+Costa leste Austrália (portos/urbano): {'SIM' if sinais['costa_leste_australia'] else 'NÃO'}
 Região mediterrânea: {'SIM' if sinais['mediterraneo'] else 'NÃO'}
 
 ════════════════════════════════════════
@@ -231,18 +294,18 @@ CONTEXTO WIKIPEDIA (raio 100km)
 {contexto_wiki if contexto_wiki else 'Nenhum artigo encontrado.'}
 
 ════════════════════════════════════════
-{"THUMBNAIL SAR INCLUÍDA ACIMA — use a imagem para confirmar o tipo de uso do solo." if tem_imagem else "THUMBNAIL: não disponível — classifique apenas pelos metadados."}
+{"IMAGEM SAR INCLUÍDA — analise o conteúdo visual para confirmar o tipo de uso do solo." if tem_imagem else "IMAGEM: não disponível — classifique apenas pelos metadados."}
 ════════════════════════════════════════
 
 GUIA DE CLASSIFICAÇÃO:
 • Área Portuária → guindastes, cais, navios atracados, terminal de contêineres
-• Agricultura / Desmatamento → padrão de talhões, campos cultivados, desmatamento
-• Área de Mineração → cratera aberta, pilhas de rejeito, estrutura de mina
+• Agricultura / Desmatamento → talhões cultivados, padrão de campos, desmatamento
+• Área de Mineração → cratera aberta, pilhas de rejeito, estrutura de mina a céu aberto
 • Base Militar → hangares, pistas, instalações isoladas, padrão geométrico restrito
 • Vulcão → cratera, fluxo de lava, cone vulcânico
-• Costa / Oceano → interface água/terra sem estrutura portuária
-• Usina de Energia → estrutura de usina, painéis solares, torres eólicas, barragem
-• Zona Urbana → malha urbana densa, apenas quando nenhuma outra categoria se aplica
+• Costa / Oceano → interface água/terra sem estrutura portuária organizada
+• Usina de Energia → usina, painéis solares, torres eólicas, barragem
+• Zona Urbana → malha urbana densa — use APENAS quando nenhuma outra se aplica
 
 Classes disponíveis:
 {classes_str}
@@ -251,23 +314,16 @@ Responda SOMENTE com JSON válido, sem texto adicional:
 {{
   "classe": "<classe escolhida>",
   "confianca": "<Alta | Média | Baixa>",
-  "justificativa": "<2-3 frases incluindo o que a imagem (se disponível) revelou>"
+  "justificativa": "<2-3 frases incluindo o que a imagem revelou (se disponível)>"
 }}"""
 
-    # ── Monta content com ou sem imagem ──────────
     content = []
-
     if tem_imagem:
         content.append({
             "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": thumb_b64,
-            }
+            "source": {"type": "base64", "media_type": "image/png", "data": thumb_b64}
         })
-
-    content.append({"type": "text", "text": texto_contexto})
+    content.append({"type": "text", "text": texto})
 
     response = bedrock.invoke_model(
         modelId="us.anthropic.claude-sonnet-4-20250514-v1:0",
@@ -288,32 +344,25 @@ Responda SOMENTE com JSON válido, sem texto adicional:
         if resultado.get("classe") not in CLASSES_POSSIVEIS:
             resultado["classe"] = "Outro / Indeterminado"
     except Exception:
-        resultado = {
-            "classe": "Outro / Indeterminado",
-            "confianca": "Baixa",
-            "justificativa": "Erro ao interpretar resposta."
-        }
+        resultado = {"classe": "Outro / Indeterminado", "confianca": "Baixa",
+                     "justificativa": "Erro ao interpretar resposta."}
 
     resultado["localizacao"] = localizacao
-    resultado["thumbnail_url"] = thumb_url or ""
+    resultado["thumbnail_url"] = thumb_url_usada or ""
     resultado["stac_browser_url"] = stac_browser_url or ""
     resultado["stac_id_repr"] = stac_repr
     resultado["thumbnail_carregada"] = tem_imagem
     return resultado
 
-
 def analisar_classe(classe: str, locais: list) -> str:
     bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
-
     resumo = ""
     for loc in locais:
         resumo += (
             f"\n- {loc['localizacao']} ({loc['lat']:.2f}, {loc['lon']:.2f})"
             f" | {loc['n_imagens']} imagens | {loc['data_inicio']} → {loc['data_fim']}"
-            f" | Confiança: {loc['confianca']}"
             f"\n  {loc['justificativa']}\n"
         )
-
     prompt = f"""Especialista em inteligência geoespacial SAR.
 A Capella Space monitorou {len(locais)} locais classificados como **{classe}**:
 {resumo}
@@ -335,38 +384,36 @@ Análise consolidada:
     )
     return json.loads(response["body"].read())["content"][0]["text"]
 
-
 print("📂 Carregando dados...")
 df = pd.read_excel(EXCEL_PATH, sheet_name="Dados_Completos")
 df['datetime'] = pd.to_datetime(df['datetime'])
-df['lat_r'] = df['center_lat'].round(2)
-df['lon_r'] = df['center_lon'].round(2)
+
+df['lat_r'] = df['center_lat'].round(AGRUPAMENTO_PRECISAO)
+df['lon_r'] = df['center_lon'].round(AGRUPAMENTO_PRECISAO)
 
 all_locations = [
     (key, group.sort_values('datetime'))
     for key, group in df.groupby(['lat_r', 'lon_r'])
 ]
 all_locations.sort(key=lambda x: -len(x[1]))
-print(f"✅ {len(all_locations)} locais encontrados")
-
+print(f"✅ {len(all_locations)} locais únicos (agrupamento ±{10**(-AGRUPAMENTO_PRECISAO)*111:.0f}km)")
 
 total = min(MAX_LOCAIS, len(all_locations))
-print(f"\n🏷️  Classificando {total} locais (com thumbnail quando disponível)...\n")
+print(f"\n🏷️  Classificando {total} locais...\n")
 
 locais_classificados = []
 
 for i, ((lat, lon), grupo) in enumerate(all_locations[:MAX_LOCAIS]):
     n = len(grupo)
-    print(f"📍 [{i+1}/{total}] ({lat:.2f}, {lon:.2f}) — {n} imagens", end="")
+    print(f"📍 [{i+1}/{total}] ({lat:.1f}, {lon:.1f}) — {n} imagens", end="", flush=True)
 
     resultado = classificar_local(grupo, lat, lon)
 
-    img_flag = "🖼️" if resultado["thumbnail_carregada"] else "📊"
-    print(f" {img_flag} → {resultado['classe']} [{resultado['confianca']}]")
+    flag = "🖼️" if resultado["thumbnail_carregada"] else "📊"
+    print(f" {flag} → {resultado['classe']} [{resultado['confianca']}]")
 
     locais_classificados.append({
-        "lat": lat,
-        "lon": lon,
+        "lat": lat, "lon": lon,
         "localizacao": resultado["localizacao"],
         "classe": resultado["classe"],
         "confianca": resultado["confianca"],
@@ -381,13 +428,11 @@ for i, ((lat, lon), grupo) in enumerate(all_locations[:MAX_LOCAIS]):
         "thumbnail_carregada": resultado["thumbnail_carregada"],
     })
 
-# ── CSV ──────────────────────────────────────
 df_resultado = pd.DataFrame(locais_classificados)
-csv_path = OUTPUT_DIR / "locais_classificados_v3.csv"
+csv_path = OUTPUT_DIR / "locais_classificados_v4.csv"
 df_resultado.to_csv(csv_path, index=False, encoding='utf-8')
-print(f"\n💾 CSV salvo: {csv_path}")
+print(f"\n💾 CSV: {csv_path}")
 
-# ── Agrupamento e análise por classe ─────────
 print("\n📊 Analisando por classe...\n")
 grupos_por_classe = {}
 for loc in locais_classificados:
@@ -395,17 +440,16 @@ for loc in locais_classificados:
 
 analises_por_classe = {}
 for classe, locais in sorted(grupos_por_classe.items(), key=lambda x: -len(x[1])):
-    print(f"🗂️  {classe}: {len(locais)} locais", end="")
+    print(f"🗂️  {classe}: {len(locais)} locais", end="", flush=True)
     analises_por_classe[classe] = analisar_classe(classe, locais)
     print(" ✅")
 
-# ── Relatório Markdown ────────────────────────
-md = "# 🛰️ Classificação de Locais — Capella SAR (v3 + Thumbnails)\n\n"
-md += f"_{len(locais_classificados)} locais classificados em {len(grupos_por_classe)} categorias_\n\n"
+md = "# 🛰️ Classificação de Locais — Capella SAR (v4)\n\n"
+md += f"_{len(locais_classificados)} locais · {len(grupos_por_classe)} categorias_\n\n"
 
 md += "## 📋 Resumo por Classe\n\n"
-md += "| Classe | Nº Locais | Total Imagens | Com Imagem | Confiança Alta |\n"
-md += "|--------|-----------|---------------|------------|----------------|\n"
+md += "| Classe | Locais | Imagens | Com Preview | Alta Confiança |\n"
+md += "|--------|--------|---------|-------------|----------------|\n"
 for classe, locais in sorted(grupos_por_classe.items(), key=lambda x: -len(x[1])):
     total_imgs = sum(l['n_imagens'] for l in locais)
     com_img = sum(1 for l in locais if l['thumbnail_carregada'])
@@ -416,34 +460,31 @@ md += "\n"
 for classe, locais in sorted(grupos_por_classe.items(), key=lambda x: -len(x[1])):
     md += "---\n\n"
     md += f"## 🏷️ {classe}\n\n"
-
     for loc in sorted(locais, key=lambda x: -x['n_imagens']):
         emoji_conf = {"Alta": "🟢", "Média": "🟡", "Baixa": "🔴"}.get(loc['confianca'], "⚪")
-        emoji_img  = "🖼️" if loc['thumbnail_carregada'] else "📊"
+        emoji_img = "🖼️" if loc['thumbnail_carregada'] else "📊"
         md += f"### 📍 {loc['localizacao']}\n\n"
-        md += f"> `{loc['lat']:.4f}, {loc['lon']:.4f}`\n\n"
+        md += f"> `{loc['lat']:.2f}, {loc['lon']:.2f}`\n\n"
         md += f"- **Imagens:** {loc['n_imagens']} | **Período:** {loc['data_inicio']} → {loc['data_fim']}\n"
         md += f"- **Plataformas:** {loc['plataformas']}\n"
         md += f"- **Confiança:** {emoji_conf} {loc['confianca']} {emoji_img}\n"
         md += f"- **Justificativa:** {loc['justificativa']}\n"
         if loc['thumbnail_url']:
-            md += f"- **Thumbnail:** [{loc['stac_id_repr']}]({loc['thumbnail_url']})\n"
+            md += f"- **Preview:** [{loc['stac_id_repr']}]({loc['thumbnail_url']})\n"
         if loc['stac_browser_url']:
             md += f"- **STAC Browser:** [Ver imagem completa]({loc['stac_browser_url']})\n"
         md += "\n"
-
     md += f"### 🔍 Análise Consolidada\n\n{analises_por_classe.get(classe, '')}\n\n"
 
-output_path = OUTPUT_DIR / "relatorio_classificado_v3.md"
+output_path = OUTPUT_DIR / "relatorio_classificado_v4.md"
 with open(output_path, 'w', encoding='utf-8') as f:
     f.write(md)
 
-print(f"\n🚀 SUCESSO!")
-print(f"   📄 Relatório: {output_path}")
-print(f"   💾 CSV:       {csv_path}")
-
 com_img = sum(1 for l in locais_classificados if l['thumbnail_carregada'])
-print(f"\n📊 {com_img}/{len(locais_classificados)} locais classificados com thumbnail visual")
-print(f"\n📊 Distribuição final:")
+print(f"\n🚀 SUCESSO!")
+print(f"   📄 {output_path}")
+print(f"   💾 {csv_path}")
+print(f"   🖼️  {com_img}/{len(locais_classificados)} locais com preview visual")
+print(f"\n📊 Distribuição:")
 for classe, locais in sorted(grupos_por_classe.items(), key=lambda x: -len(x[1])):
     print(f"   {classe:<35} {len(locais):>3} locais")
