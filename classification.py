@@ -4,6 +4,7 @@ import boto3
 import requests
 import base64
 import io
+import math
 from pathlib import Path
 
 EXCEL_PATH = "resultados_editado.xlsx"
@@ -11,6 +12,7 @@ OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 MAX_LOCAIS = 9999
+AGRUPAMENTO_PRECISAO = 1
 
 CLASSES_POSSIVEIS = [
     "Área de Mineração",
@@ -26,180 +28,287 @@ CLASSES_POSSIVEIS = [
 
 CAPELLA_S3_BASE = "https://capella-open-data.s3.amazonaws.com/stac/capella-open-data-by-datetime"
 
-AGRUPAMENTO_PRECISAO = 1
+CIDADES_PORTUARIAS = [
+    "new york", "newark", "los angeles", "long beach", "seattle", "tacoma",
+    "houston", "new orleans", "miami", "baltimore", "savannah", "charleston",
+    "vancouver", "montreal", "halifax",
+    "rotterdam", "antwerp", "antwerpen", "hamburg", "bremen", "barcelona",
+    "valencia", "algeciras", "marseille", "genova", "genoa", "piraeus",
+    "amsterdam", "felixstowe", "southampton", "le havre",
+    "alicante", "alacant", "gdansk", "lisbon", "lisboa",
+    "shanghai", "shenzhen", "guangzhou", "tianjin", "qingdao", "ningbo",
+    "singapore", "busan", "tokyo", "yokohama", "osaka",
+    "hong kong", "kaohsiung", "colombo", "mumbai", "chennai",
+    "sydney", "melbourne", "brisbane", "fremantle", "adelaide",
+    "dubai", "jebel ali", "abu dhabi", "jeddah", "dammam",
+    "durban", "cape town", "mombasa", "lagos", "dakar",
+    "santos", "paranagua", "rio de janeiro", "itajai", "buenos aires",
+    "valparaiso", "callao", "guayaquil", "cartagena", "colon",
+]
 
+def _e_cidade_portuaria(address: dict) -> tuple[bool, str]:
+    cidade = (address.get("city") or address.get("town") or address.get("village") or "").lower()
+    estado = address.get("state", "").lower()
+    pais = address.get("country", "").lower()
+    texto = f"{cidade} {estado} {pais}"
+    for cp in CIDADES_PORTUARIAS:
+        if cp in texto:
+            return True, cp.title()
+    return False, ""
+
+
+# ── OVERPASS: tags OSM reais num raio ──────────────────────────────────────
+OSM_TAG_CLASSES = {
+    "Área Portuária":           ["harbour", "port", "dock", "ferry_terminal", "container_terminal"],
+    "Área de Mineração":        ["quarry", "mine", "mining"],
+    "Base Militar":             ["military", "airfield", "naval_base", "barracks"],
+    "Usina de Energia":         ["power_station", "power_plant", "nuclear", "solar_farm", "wind_farm", "dam"],
+    "Agricultura / Desmatamento": ["farmland", "farmyard", "orchard", "vineyard", "greenhouse"],
+    "Vulcão / Atividade Geológica": ["volcano"],
+}
+
+def buscar_tags_osm(lat: float, lon: float, raio_m: int = 8000) -> dict:
+    """
+    Consulta Overpass API para encontrar tags OSM significativas num raio.
+    Retorna dict com tags encontradas agrupadas por classe.
+    """
+    tags_por_classe = {}
+    try:
+        filtros = []
+        for classe, tags in OSM_TAG_CLASSES.items():
+            for tag in tags:
+                filtros.append(f'node(around:{raio_m},{lat},{lon})["{tag}"];')
+                filtros.append(f'way(around:{raio_m},{lat},{lon})["{tag}"];')
+                filtros.append(f'node(around:{raio_m},{lat},{lon})["landuse"="{tag}"];')
+                filtros.append(f'way(around:{raio_m},{lat},{lon})["landuse"="{tag}"];')
+                filtros.append(f'node(around:{raio_m},{lat},{lon})["industrial"="{tag}"];')
+                filtros.append(f'way(around:{raio_m},{lat},{lon})["industrial"="{tag}"];')
+
+        query = f"""
+[out:json][timeout:8];
+(
+{''.join(filtros)}
+);
+out tags 50;
+"""
+        r = requests.post(
+            "https://overpass-api.de/api/interpreter",
+            data={"data": query},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return {}
+
+        elements = r.json().get("elements", [])
+        encontrados = set()
+        for el in elements:
+            tags = el.get("tags", {})
+            for key in ["landuse", "industrial", "harbour", "military",
+                        "power", "natural", "amenity"]:
+                if key in tags:
+                    encontrados.add(f"{key}={tags[key]}")
+
+        for classe, keywords in OSM_TAG_CLASSES.items():
+            matches = [t for t in encontrados if any(k in t for k in keywords)]
+            if matches:
+                tags_por_classe[classe] = matches
+
+    except Exception:
+        pass
+
+    return tags_por_classe
+
+
+# ── IMAGEM FALLBACK: OSM tile stitching ────────────────────────────────────
+def _latlon_para_tile(lat: float, lon: float, zoom: int) -> tuple[int, int]:
+    n = 2 ** zoom
+    x = int((lon + 180) / 360 * n)
+    y = int((1 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2 * n)
+    return x, y
+
+def baixar_mapa_satelite_b64(lat: float, lon: float, zoom: int = 14) -> str | None:
+    """
+    Baixa tile de satélite do Esri ArcGIS (sem API key, uso público).
+    Fallback: OpenTopoMap.
+    """
+    try:
+        from PIL import Image
+
+        x, y = _latlon_para_tile(lat, lon, zoom)
+
+        # Tenta 3x3 tiles para dar contexto espacial
+        tiles = []
+        for dy in [-1, 0, 1]:
+            row = []
+            for dx in [-1, 0, 1]:
+                tx, ty = x + dx, y + dy
+                url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{ty}/{tx}"
+                r = requests.get(url, timeout=8, headers={"User-Agent": "capella-sar-classifier"})
+                if r.status_code == 200:
+                    tile_img = Image.open(io.BytesIO(r.content)).convert("RGB")
+                    row.append(tile_img)
+                else:
+                    return None
+            tiles.append(row)
+
+        tw, th = tiles[0][0].size
+        combined = Image.new("RGB", (tw * 3, th * 3))
+        for row_i, row in enumerate(tiles):
+            for col_i, tile in enumerate(row):
+                combined.paste(tile, (col_i * tw, row_i * th))
+
+        combined.thumbnail((512, 512), Image.LANCZOS)
+        buf = io.BytesIO()
+        combined.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return None
+
+
+# ── PREVIEW SAR ────────────────────────────────────────────────────────────
 def stac_id_para_urls(stac_id: str) -> dict:
-    """
-    Monta URLs a partir do stac_id.
-    Ex: CAPELLA_C13_SP_GEO_HH_20251108032444_20251108032453
-    """
     try:
         partes = stac_id.split("_")
         data_str = partes[5]
-        ano = data_str[0:4]
-        mes = data_str[4:6]
-        dia = data_str[6:8]
-
+        ano, mes, dia = data_str[0:4], data_str[4:6], data_str[6:8]
         pasta = (
-            f"{CAPELLA_S3_BASE}"
-            f"/capella-open-data-{ano}"
+            f"{CAPELLA_S3_BASE}/capella-open-data-{ano}"
             f"/capella-open-data-{ano}-{mes}"
-            f"/capella-open-data-{ano}-{mes}-{dia}"
-            f"/{stac_id}"
+            f"/capella-open-data-{ano}-{mes}-{dia}/{stac_id}"
         )
-
-        preview_candidates = [
-            f"{pasta}/{stac_id}_PREVIEW.tif",
-            f"{pasta}/{stac_id}_OVERVIEW.tif",
-            f"{pasta}/preview.tif",
-            f"{pasta}/overview.tif",
-            f"{pasta}/thumbnail.png",   
-        ]
-
-        stac_browser = (
-            "https://radiantearth.github.io/stac-browser/#/external/"
-            f"capella-open-data.s3.amazonaws.com/stac/capella-open-data-by-datetime"
-            f"/capella-open-data-{ano}/capella-open-data-{ano}-{mes}"
-            f"/capella-open-data-{ano}-{mes}-{dia}/{stac_id}/{stac_id}.json"
-        )
-
         return {
-            "preview_candidates": preview_candidates,
+            "preview_candidates": [
+                f"{pasta}/{stac_id}_PREVIEW.tif",
+                f"{pasta}/{stac_id}_OVERVIEW.tif",
+                f"{pasta}/preview.tif",
+                f"{pasta}/overview.tif",
+                f"{pasta}/thumbnail.png",
+            ],
             "stac_json": f"{pasta}/{stac_id}.json",
-            "stac_browser": stac_browser,
+            "stac_browser": (
+                "https://radiantearth.github.io/stac-browser/#/external/"
+                f"capella-open-data.s3.amazonaws.com/stac/capella-open-data-by-datetime"
+                f"/capella-open-data-{ano}/capella-open-data-{ano}-{mes}"
+                f"/capella-open-data-{ano}-{mes}-{dia}/{stac_id}/{stac_id}.json"
+            ),
         }
     except Exception:
         return {"preview_candidates": [], "stac_json": None, "stac_browser": None}
 
-def baixar_preview_base64(stac_id: str) -> tuple[str | None, str | None]:
-    """
-    Tenta baixar o preview do item STAC.
-    Primeiro lê o JSON para pegar o href exato do asset 'preview'.
-    Fallback: tenta URLs candidatas em ordem.
-    Retorna: (base64_bytes, url_usada)
-    """
-    MAX_BYTES = 5 * 1024 * 1024  # 5MB max — evita baixar GeoTIFF completo
-    TIMEOUT_JSON = 5
-    TIMEOUT_IMG = 8
-
-    urls_info = stac_id_para_urls(stac_id)
-
-    try:
-        r = requests.get(urls_info["stac_json"], timeout=TIMEOUT_JSON)
-        if r.status_code == 200:
-            stac = r.json()
-            assets = stac.get("assets", {})
-            for key, asset in assets.items():
-                roles = asset.get("roles", [])
-                if any(role in roles for role in ["overview", "thumbnail", "visual"]):
-                    href = asset.get("href", "")
-                    # Stream com limite de tamanho
-                    img_r = requests.get(href, timeout=TIMEOUT_IMG, stream=True)
-                    if img_r.status_code == 200:
-                        content = b""
-                        for chunk in img_r.iter_content(chunk_size=65536):
-                            content += chunk
-                            if len(content) > MAX_BYTES:
-                                break
-                        img_r.close()
-                        media_type = asset.get("type", "image/tiff")
-                        data_b64 = _converter_para_png_b64(content, media_type)
-                        if data_b64:
-                            return data_b64, href
-    except Exception:
-        pass
-
-    for url in urls_info.get("preview_candidates", []):
-        try:
-            r = requests.get(url, timeout=TIMEOUT_IMG, stream=True)
-            if r.status_code == 200:
-                content = b""
-                for chunk in r.iter_content(chunk_size=65536):
-                    content += chunk
-                    if len(content) > MAX_BYTES:
-                        break
-                r.close()
-                media_type = "image/tiff" if url.endswith(".tif") else "image/png"
-                data_b64 = _converter_para_png_b64(content, media_type)
-                if data_b64:
-                    return data_b64, url
-        except Exception:
-            continue
-
-    return None, None
 
 def _converter_para_png_b64(content: bytes, media_type: str) -> str | None:
-    """Converte bytes de imagem (TIF ou PNG) para base64 PNG."""
     try:
         from PIL import Image
         import numpy as np
-
         img = Image.open(io.BytesIO(content))
-
         if img.mode not in ("RGB", "RGBA", "L"):
             arr = np.array(img, dtype=float)
             p2, p98 = np.percentile(arr[arr > 0], [2, 98]) if arr.max() > 0 else (0, 1)
             arr = np.clip((arr - p2) / max(p98 - p2, 1e-6) * 255, 0, 255).astype("uint8")
             img = Image.fromarray(arr, mode="L")
-
         img.thumbnail((512, 512), Image.LANCZOS)
-
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception:
-        if b"\x89PNG" in content[:8]:
+        if content[:8].startswith(b"\x89PNG"):
             return base64.b64encode(content).decode("utf-8")
         return None
 
+
+def baixar_preview_sar_b64(stac_id: str) -> tuple[str | None, str | None]:
+    MAX_BYTES = 5 * 1024 * 1024
+    urls_info = stac_id_para_urls(stac_id)
+    try:
+        r = requests.get(urls_info["stac_json"], timeout=5)
+        if r.status_code == 200:
+            assets = r.json().get("assets", {})
+            for asset in assets.values():
+                if any(role in asset.get("roles", []) for role in ["overview", "thumbnail", "visual"]):
+                    href = asset.get("href", "")
+                    img_r = requests.get(href, timeout=8, stream=True)
+                    if img_r.status_code == 200:
+                        content = b"".join(
+                            chunk for chunk in img_r.iter_content(65536)
+                            if len(content := b"") == 0 or True
+                        )
+                        content = b""
+                        for chunk in img_r.iter_content(65536):
+                            content += chunk
+                            if len(content) > MAX_BYTES:
+                                break
+                        img_r.close()
+                        b64 = _converter_para_png_b64(content, asset.get("type", "image/tiff"))
+                        if b64:
+                            return b64, href
+    except Exception:
+        pass
+
+    for url in urls_info.get("preview_candidates", []):
+        try:
+            r = requests.get(url, timeout=8, stream=True)
+            if r.status_code == 200:
+                content = b""
+                for chunk in r.iter_content(65536):
+                    content += chunk
+                    if len(content) > MAX_BYTES:
+                        break
+                r.close()
+                b64 = _converter_para_png_b64(content, "image/tiff" if url.endswith(".tif") else "image/png")
+                if b64:
+                    return b64, url
+        except Exception:
+            continue
+    return None, None
+
+
 def escolher_thumbnail_representativa(grupo: pd.DataFrame) -> tuple[str, str]:
-    """Escolhe o melhor stac_id do grupo e retorna (stac_id, stac_browser_url)."""
     for tipo in ["GEO", "SLC", "GEC"]:
         sub = grupo[grupo['stac_id'].str.contains(f"_{tipo}_")]
         if not sub.empty:
             melhor = sub.loc[sub['resolution_range'].idxmin()]
-            urls = stac_id_para_urls(melhor['stac_id'])
-            return melhor['stac_id'], urls["stac_browser"]
+            return melhor['stac_id'], stac_id_para_urls(melhor['stac_id'])["stac_browser"]
     melhor = grupo.loc[grupo['resolution_range'].idxmin()]
-    urls = stac_id_para_urls(melhor['stac_id'])
-    return melhor['stac_id'], urls["stac_browser"]
+    return melhor['stac_id'], stac_id_para_urls(melhor['stac_id'])["stac_browser"]
 
+
+# ── GEO ────────────────────────────────────────────────────────────────────
 def buscar_contexto_geo(lat: float, lon: float) -> dict:
     try:
-        url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&zoom=14&addressdetails=1"
-        r = requests.get(url, headers={"User-Agent": "capella-sar-classifier"}, timeout=10)
+        r = requests.get(
+            f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&zoom=14&addressdetails=1",
+            headers={"User-Agent": "capella-sar-classifier"}, timeout=8
+        )
         return r.json() if r.status_code == 200 else {}
     except Exception:
         return {}
 
+
 def buscar_wikipedia(lat: float, lon: float, raio_km: int = 100) -> str:
     try:
-        params = {
+        r = requests.get("https://en.wikipedia.org/w/api.php", params={
             "action": "query", "list": "geosearch",
-            "gscoord": f"{lat}|{lon}",
-            "gsradius": raio_km * 1000,
+            "gscoord": f"{lat}|{lon}", "gsradius": raio_km * 1000,
             "gslimit": 5, "format": "json"
-        }
-        r = requests.get("https://en.wikipedia.org/w/api.php", params=params, timeout=10)
+        }, timeout=8)
         if r.status_code != 200:
             return ""
         results = r.json().get("query", {}).get("geosearch", [])
         textos = []
         for item in results[:3]:
-            page_r = requests.get("https://en.wikipedia.org/w/api.php", params={
+            pr = requests.get("https://en.wikipedia.org/w/api.php", params={
                 "action": "query", "pageids": item["pageid"],
-                "prop": "extracts", "exintro": True,
-                "explaintext": True, "format": "json"
-            }, timeout=10)
-            if page_r.status_code == 200:
-                pages = page_r.json().get("query", {}).get("pages", {})
-                for page in pages.values():
+                "prop": "extracts", "exintro": True, "explaintext": True, "format": "json"
+            }, timeout=8)
+            if pr.status_code == 200:
+                for page in pr.json().get("query", {}).get("pages", {}).values():
                     extract = page.get("extract", "")[:700]
                     if extract:
                         textos.append(f"### {item['title']} (~{item.get('dist',0)/1000:.0f}km)\n{extract}")
         return "\n\n".join(textos)
     except Exception:
         return ""
+
 
 def analisar_metadados_tecnicos(grupo: pd.DataFrame) -> dict:
     return {
@@ -213,10 +322,10 @@ def analisar_metadados_tecnicos(grupo: pd.DataFrame) -> dict:
         "imagens_por_mes": round(len(grupo) / max((grupo['datetime'].max() - grupo['datetime'].min()).days / 30, 1), 1),
     }
 
+
 def sinais_indiretos(lat: float, lon: float, grupo: pd.DataFrame) -> dict:
     periodo = (grupo['datetime'].max() - grupo['datetime'].min()).days
-    n = len(grupo)
-    freq = periodo / max(n - 1, 1)
+    freq = periodo / max(len(grupo) - 1, 1)
     return {
         "zona_climatica": (
             "Polar/Subpolar" if abs(lat) > 60 else
@@ -235,6 +344,8 @@ def sinais_indiretos(lat: float, lon: float, grupo: pd.DataFrame) -> dict:
         "multiplas_plataformas": len(grupo['platform'].unique()) > 1,
     }
 
+
+# ── CLASSIFICAÇÃO ──────────────────────────────────────────────────────────
 def classificar_local(grupo: pd.DataFrame, lat: float, lon: float) -> dict:
     bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
 
@@ -243,24 +354,46 @@ def classificar_local(grupo: pd.DataFrame, lat: float, lon: float) -> dict:
     address = geo_data.get("address", {})
     osm_type = geo_data.get("type", "")
     osm_class = geo_data.get("class", "")
+
     contexto_wiki = buscar_wikipedia(lat, lon, raio_km=100)
+    tags_osm = buscar_tags_osm(lat, lon, raio_m=8000)
     tecnico = analisar_metadados_tecnicos(grupo)
     sinais = sinais_indiretos(lat, lon, grupo)
+    e_porto, nome_porto = _e_cidade_portuaria(address)
 
     localizacao = ", ".join(filter(None, [
         address.get("city") or address.get("town") or address.get("village"),
-        address.get("state"),
-        address.get("country")
+        address.get("state"), address.get("country")
     ])) or f"{lat:.2f}, {lon:.2f}"
 
+    # Tenta preview SAR primeiro, depois satélite como fallback
     stac_repr, stac_browser_url = escolher_thumbnail_representativa(grupo)
-    thumb_b64, thumb_url_usada = baixar_preview_base64(stac_repr)
+    thumb_b64, thumb_url_usada = baixar_preview_sar_b64(stac_repr)
+    fonte_imagem = "SAR (Capella)"
+
+    if not thumb_b64:
+        thumb_b64 = baixar_mapa_satelite_b64(lat, lon, zoom=14)
+        thumb_url_usada = f"Esri Satellite tile ({lat:.2f},{lon:.2f})"
+        fonte_imagem = "Satélite Esri (fallback)"
+
     tem_imagem = thumb_b64 is not None
+
+    # Formata tags OSM encontradas
+    tags_str = ""
+    if tags_osm:
+        for cls, tags in tags_osm.items():
+            tags_str += f"\n  → {cls}: {', '.join(tags)}"
+    else:
+        tags_str = "\n  Nenhuma tag específica encontrada."
 
     classes_str = "\n".join(f"- {c}" for c in CLASSES_POSSIVEIS)
 
+    img_desc = "não disponível"
+    if tem_imagem:
+        img_desc = f"INCLUÍDA ({fonte_imagem}) — analise o conteúdo visual"
+
     texto = f"""Você é um analista sênior de inteligência geoespacial com expertise em imagens SAR.
-Classifique este local monitorado pela Capella Space.
+Classifique este local monitorado pela Capella Space usando TODOS os sinais abaixo.
 
 ════════════════════════════════════════
 DADOS GEOGRÁFICOS (OpenStreetMap)
@@ -271,6 +404,10 @@ Tipo OSM: {osm_class} / {osm_type}
 País: {address.get('country','N/D')} | Estado: {address.get('state','N/D')}
 
 ════════════════════════════════════════
+TAGS OSM REAIS (Overpass API, raio 8km)
+════════════════════════════════════════{tags_str}
+
+════════════════════════════════════════
 SINAIS INDIRETOS
 ════════════════════════════════════════
 Zona climática: {sinais['zona_climatica']} (hemisfério {sinais['hemisferio']})
@@ -278,6 +415,7 @@ Tropical (potencial agrícola): {'SIM' if sinais['proximo_equador'] else 'NÃO'}
 Costa oeste Austrália (Pilbara/mineração): {'SIM' if sinais['costa_oeste_australia'] else 'NÃO'}
 Costa leste Austrália (portos/urbano): {'SIM' if sinais['costa_leste_australia'] else 'NÃO'}
 Região mediterrânea: {'SIM' if sinais['mediterraneo'] else 'NÃO'}
+Cidade portuária conhecida: {'⚠️ SIM — ' + nome_porto if e_porto else 'NÃO'}
 
 ════════════════════════════════════════
 PADRÃO DE MONITORAMENTO SAR
@@ -294,18 +432,24 @@ CONTEXTO WIKIPEDIA (raio 100km)
 {contexto_wiki if contexto_wiki else 'Nenhum artigo encontrado.'}
 
 ════════════════════════════════════════
-{"IMAGEM SAR INCLUÍDA — analise o conteúdo visual para confirmar o tipo de uso do solo." if tem_imagem else "IMAGEM: não disponível — classifique apenas pelos metadados."}
+IMAGEM: {img_desc}
 ════════════════════════════════════════
 
-GUIA DE CLASSIFICAÇÃO:
-• Área Portuária → guindastes, cais, navios atracados, terminal de contêineres
-• Agricultura / Desmatamento → talhões cultivados, padrão de campos, desmatamento
-• Área de Mineração → cratera aberta, pilhas de rejeito, estrutura de mina a céu aberto
-• Base Militar → hangares, pistas, instalações isoladas, padrão geométrico restrito
+REGRAS DE CLASSIFICAÇÃO (em ordem de prioridade):
+1. Se tags OSM indicam uma classe específica → use essa classe
+2. Se "Cidade portuária conhecida" = SIM → Área Portuária (mesmo que OSM mostre rua residencial)
+3. Se a imagem mostrar estrutura clara → use o que a imagem revela
+4. Use os sinais indiretos para desempatar
+
+GUIA VISUAL:
+• Área Portuária → cais, guindastes, navios, terminal de contêineres
+• Agricultura / Desmatamento → talhões, campos cultivados, desmatamento em padrão geométrico
+• Área de Mineração → cratera aberta, pilhas de rejeito, estradas de acesso radiais
+• Base Militar → hangares, pistas, instalações isoladas com perímetro definido
 • Vulcão → cratera, fluxo de lava, cone vulcânico
-• Costa / Oceano → interface água/terra sem estrutura portuária organizada
-• Usina de Energia → usina, painéis solares, torres eólicas, barragem
-• Zona Urbana → malha urbana densa — use APENAS quando nenhuma outra se aplica
+• Costa / Oceano → interface água/terra sem porto organizado
+• Usina de Energia → estrutura de usina, painéis solares em grade, torres eólicas, barragem
+• Zona Urbana → malha urbana — use APENAS quando nenhuma outra se aplica
 
 Classes disponíveis:
 {classes_str}
@@ -314,7 +458,7 @@ Responda SOMENTE com JSON válido, sem texto adicional:
 {{
   "classe": "<classe escolhida>",
   "confianca": "<Alta | Média | Baixa>",
-  "justificativa": "<2-3 frases incluindo o que a imagem revelou (se disponível)>"
+  "justificativa": "<2-3 frases descrevendo os sinais decisivos>"
 }}"""
 
     content = []
@@ -349,11 +493,15 @@ Responda SOMENTE com JSON válido, sem texto adicional:
 
     resultado["localizacao"] = localizacao
     resultado["thumbnail_url"] = thumb_url_usada or ""
+    resultado["fonte_imagem"] = fonte_imagem if tem_imagem else "nenhuma"
     resultado["stac_browser_url"] = stac_browser_url or ""
     resultado["stac_id_repr"] = stac_repr
     resultado["thumbnail_carregada"] = tem_imagem
+    resultado["tags_osm"] = "; ".join(f"{k}: {','.join(v)}" for k, v in tags_osm.items())
     return resultado
 
+
+# ── ANÁLISE POR CLASSE ─────────────────────────────────────────────────────
 def analisar_classe(classe: str, locais: list) -> str:
     bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
     resumo = ""
@@ -363,7 +511,12 @@ def analisar_classe(classe: str, locais: list) -> str:
             f" | {loc['n_imagens']} imagens | {loc['data_inicio']} → {loc['data_fim']}"
             f"\n  {loc['justificativa']}\n"
         )
-    prompt = f"""Especialista em inteligência geoespacial SAR.
+    response = bedrock.invoke_model(
+        modelId="us.anthropic.claude-sonnet-4-20250514-v1:0",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1500,
+            "messages": [{"role": "user", "content": f"""Especialista em inteligência geoespacial SAR.
 A Capella Space monitorou {len(locais)} locais classificados como **{classe}**:
 {resumo}
 
@@ -372,44 +525,37 @@ Análise consolidada:
 2. **Intensidade** — Quais recebem mais atenção e por quê?
 3. **Relevância Estratégica** — Por que a Capella monitora esses locais?
 4. **Padrões em Comum** — O que une esses locais?
-5. **Insight Principal** — Descoberta mais importante do grupo."""
-
-    response = bedrock.invoke_model(
-        modelId="us.anthropic.claude-sonnet-4-20250514-v1:0",
-        body=json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 1500,
-            "messages": [{"role": "user", "content": prompt}]
+5. **Insight Principal** — Descoberta mais importante do grupo."""}]
         })
     )
     return json.loads(response["body"].read())["content"][0]["text"]
 
+
+# ── PIPELINE ───────────────────────────────────────────────────────────────
 print("📂 Carregando dados...")
 df = pd.read_excel(EXCEL_PATH, sheet_name="Dados_Completos")
 df['datetime'] = pd.to_datetime(df['datetime'])
-
 df['lat_r'] = df['center_lat'].round(AGRUPAMENTO_PRECISAO)
 df['lon_r'] = df['center_lon'].round(AGRUPAMENTO_PRECISAO)
 
-all_locations = [
-    (key, group.sort_values('datetime'))
-    for key, group in df.groupby(['lat_r', 'lon_r'])
-]
-all_locations.sort(key=lambda x: -len(x[1]))
+all_locations = sorted(
+    [(key, group.sort_values('datetime')) for key, group in df.groupby(['lat_r', 'lon_r'])],
+    key=lambda x: -len(x[1])
+)
 print(f"✅ {len(all_locations)} locais únicos (agrupamento ±{10**(-AGRUPAMENTO_PRECISAO)*111:.0f}km)")
 
 total = min(MAX_LOCAIS, len(all_locations))
 print(f"\n🏷️  Classificando {total} locais...\n")
 
 locais_classificados = []
-
 for i, ((lat, lon), grupo) in enumerate(all_locations[:MAX_LOCAIS]):
     n = len(grupo)
     print(f"📍 [{i+1}/{total}] ({lat:.1f}, {lon:.1f}) — {n} imagens", end="", flush=True)
 
     resultado = classificar_local(grupo, lat, lon)
 
-    flag = "🖼️" if resultado["thumbnail_carregada"] else "📊"
+    icons = {"SAR (Capella)": "🛰️", "Satélite Esri (fallback)": "🗺️", "nenhuma": "📊"}
+    flag = icons.get(resultado["fonte_imagem"], "📊")
     print(f" {flag} → {resultado['classe']} [{resultado['confianca']}]")
 
     locais_classificados.append({
@@ -423,13 +569,15 @@ for i, ((lat, lon), grupo) in enumerate(all_locations[:MAX_LOCAIS]):
         "data_fim": str(grupo['datetime'].max().date()),
         "plataformas": ', '.join(grupo['platform'].unique()),
         "thumbnail_url": resultado["thumbnail_url"],
+        "fonte_imagem": resultado["fonte_imagem"],
         "stac_browser_url": resultado["stac_browser_url"],
         "stac_id_repr": resultado["stac_id_repr"],
         "thumbnail_carregada": resultado["thumbnail_carregada"],
+        "tags_osm": resultado["tags_osm"],
     })
 
 df_resultado = pd.DataFrame(locais_classificados)
-csv_path = OUTPUT_DIR / "locais_classificados_v4.csv"
+csv_path = OUTPUT_DIR / "locais_classificados_v5.csv"
 df_resultado.to_csv(csv_path, index=False, encoding='utf-8')
 print(f"\n💾 CSV: {csv_path}")
 
@@ -444,17 +592,18 @@ for classe, locais in sorted(grupos_por_classe.items(), key=lambda x: -len(x[1])
     analises_por_classe[classe] = analisar_classe(classe, locais)
     print(" ✅")
 
-md = "# 🛰️ Classificação de Locais — Capella SAR (v4)\n\n"
+md = "# 🛰️ Classificação de Locais — Capella SAR (v5)\n\n"
 md += f"_{len(locais_classificados)} locais · {len(grupos_por_classe)} categorias_\n\n"
 
 md += "## 📋 Resumo por Classe\n\n"
-md += "| Classe | Locais | Imagens | Com Preview | Alta Confiança |\n"
-md += "|--------|--------|---------|-------------|----------------|\n"
+md += "| Classe | Locais | Imagens | Fonte Imagem | Alta Confiança |\n"
+md += "|--------|--------|---------|--------------|----------------|\n"
 for classe, locais in sorted(grupos_por_classe.items(), key=lambda x: -len(x[1])):
     total_imgs = sum(l['n_imagens'] for l in locais)
-    com_img = sum(1 for l in locais if l['thumbnail_carregada'])
+    sar = sum(1 for l in locais if l['fonte_imagem'] == 'SAR (Capella)')
+    esri = sum(1 for l in locais if l['fonte_imagem'] == 'Satélite Esri (fallback)')
     alta = sum(1 for l in locais if l['confianca'] == 'Alta')
-    md += f"| {classe} | {len(locais)} | {total_imgs} | {com_img}/{len(locais)} | {alta}/{len(locais)} |\n"
+    md += f"| {classe} | {len(locais)} | {total_imgs} | 🛰️{sar} 🗺️{esri} | {alta}/{len(locais)} |\n"
 md += "\n"
 
 for classe, locais in sorted(grupos_por_classe.items(), key=lambda x: -len(x[1])):
@@ -462,13 +611,15 @@ for classe, locais in sorted(grupos_por_classe.items(), key=lambda x: -len(x[1])
     md += f"## 🏷️ {classe}\n\n"
     for loc in sorted(locais, key=lambda x: -x['n_imagens']):
         emoji_conf = {"Alta": "🟢", "Média": "🟡", "Baixa": "🔴"}.get(loc['confianca'], "⚪")
-        emoji_img = "🖼️" if loc['thumbnail_carregada'] else "📊"
+        emoji_img = {"SAR (Capella)": "🛰️", "Satélite Esri (fallback)": "🗺️"}.get(loc['fonte_imagem'], "📊")
         md += f"### 📍 {loc['localizacao']}\n\n"
         md += f"> `{loc['lat']:.2f}, {loc['lon']:.2f}`\n\n"
         md += f"- **Imagens:** {loc['n_imagens']} | **Período:** {loc['data_inicio']} → {loc['data_fim']}\n"
         md += f"- **Plataformas:** {loc['plataformas']}\n"
         md += f"- **Confiança:** {emoji_conf} {loc['confianca']} {emoji_img}\n"
         md += f"- **Justificativa:** {loc['justificativa']}\n"
+        if loc['tags_osm']:
+            md += f"- **Tags OSM:** `{loc['tags_osm']}`\n"
         if loc['thumbnail_url']:
             md += f"- **Preview:** [{loc['stac_id_repr']}]({loc['thumbnail_url']})\n"
         if loc['stac_browser_url']:
@@ -476,15 +627,16 @@ for classe, locais in sorted(grupos_por_classe.items(), key=lambda x: -len(x[1])
         md += "\n"
     md += f"### 🔍 Análise Consolidada\n\n{analises_por_classe.get(classe, '')}\n\n"
 
-output_path = OUTPUT_DIR / "relatorio_classificado_v4.md"
+output_path = OUTPUT_DIR / "relatorio_classificado_v5.md"
 with open(output_path, 'w', encoding='utf-8') as f:
     f.write(md)
 
-com_img = sum(1 for l in locais_classificados if l['thumbnail_carregada'])
+sar_count = sum(1 for l in locais_classificados if l['fonte_imagem'] == 'SAR (Capella)')
+esri_count = sum(1 for l in locais_classificados if l['fonte_imagem'] == 'Satélite Esri (fallback)')
 print(f"\n🚀 SUCESSO!")
 print(f"   📄 {output_path}")
 print(f"   💾 {csv_path}")
-print(f"   🖼️  {com_img}/{len(locais_classificados)} locais com preview visual")
+print(f"   🛰️  {sar_count} com preview SAR | 🗺️ {esri_count} com satélite Esri")
 print(f"\n📊 Distribuição:")
 for classe, locais in sorted(grupos_por_classe.items(), key=lambda x: -len(x[1])):
     print(f"   {classe:<35} {len(locais):>3} locais")
